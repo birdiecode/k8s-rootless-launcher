@@ -1,0 +1,13 @@
+[submodule "pnfroot"]
+	path = pnfroot
+	url = https://github.com/birdiecode/pnfroot.git
+[submodule "pnfroot-kube-proxy"]
+	path = pnfroot-kube-proxy
+	url = https://github.com/birdiecode/pnfroot-kube-proxy.git
+[submodule "k8s-rootless-lab"]
+	path = k8s-rootless-lab
+	url = https://github.com/birdiecode/k8s-rootless-lab.git
+[submodule "kubernetes-pnf"]
+	path = kubernetes-pnf
+	url = https://github.com/birdiecode/kubernetes-pnf.git
+	shallow = true
