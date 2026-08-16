@@ -11,6 +11,8 @@ VENV_DIR="$ROOT_DIR/.venv"
 BIN_DIR="$LAB_DIR/.local/bin"
 SESSION="rlk8s"
 ETCD_VERSION="${ETCD_VERSION:-3.7.1}"
+START_TIMEOUT="${START_TIMEOUT:-120}"
+START_NGINX="${START_NGINX:-1}"
 
 log() {
     printf '\033[1;34m[rlk8s]\033[0m %s\n' "$*"
@@ -134,6 +136,22 @@ prepare_lab() {
     fi
 }
 
+require_runtime_files() {
+    local file
+
+    for file in \
+        "$BIN_DIR/etcd" \
+        "$BIN_DIR/kubectl" \
+        "$K8S_DIR/_output/bin/kube-apiserver" \
+        "$K8S_DIR/_output/bin/kube-controller-manager" \
+        "$K8S_DIR/_output/bin/kubelet"; do
+        [[ -x "$file" ]] || die "Нет исполняемого файла $file. Сначала выполни: $0 init"
+    done
+
+    [[ -f "$PNFROOT_DIR/pnfroot.py" ]] || die "Нет $PNFROOT_DIR/pnfroot.py"
+    [[ -f "$PROXY_DIR/main.py" ]] || die "Нет $PROXY_DIR/main.py"
+}
+
 init_all() {
     init_submodules
     check_layout
@@ -158,46 +176,97 @@ tmux_window() {
     tmux new-window \
         -t "$SESSION" \
         -n "$name" \
-        "cd '$LAB_DIR' && source '$VENV_DIR/bin/activate' && exec $command"
+        "cd '$LAB_DIR' && exec bash -lc '$command 2>&1 | tee .state/k8s/$name.log'"
+}
+
+kubectl_lab() {
+    KUBECONFIG="$LAB_DIR/.state/k8s/etc/admin.kubeconfig" \
+        "$BIN_DIR/kubectl" "$@"
+}
+
+wait_until() {
+    local description="$1"
+    shift
+    local deadline=$((SECONDS + START_TIMEOUT))
+
+    while ! "$@" >/dev/null 2>&1; do
+        (( SECONDS < deadline )) || die "Истекло время ожидания: $description"
+        sleep 1
+    done
+
+    log "Готово: $description"
+}
+
+etcd_ready() {
+    curl -fsS --max-time 2 http://127.0.0.1:2379/health | grep -q '"health":"true"'
+}
+
+api_ready() {
+    kubectl_lab get --raw=/readyz 2>/dev/null | grep -q '^ok$'
+}
+
+runtime_ready() {
+    [[ -S "$LAB_DIR/.state/k8s/run/pnfroot.sock" ]]
+}
+
+node_ready() {
+    [[ "$(kubectl_lab get node node1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == "True" ]]
 }
 
 start_lab() {
     require_cmd tmux
+    require_cmd curl
     check_layout
-
-    [[ -x "$VENV_DIR/bin/python" ]] ||
-        die "Virtualenv не создан. Сначала запусти: $0 init"
-
-    [[ -x "$BIN_DIR/etcd" ]] ||
-        die "etcd не установлен. Выполни: $0 install-etcd"
+    prepare_lab
+    require_runtime_files
 
     if tmux has-session -t "$SESSION" 2>/dev/null; then
-        die "Сессия tmux '$SESSION' уже запущена."
+        log "Сессия tmux '$SESSION' уже существует. Проверяю кластер."
+        status_lab
+        return
     fi
 
-    log "Запуск стенда в tmux..."
+    mkdir -p "$LAB_DIR/.state/k8s/run"
+    log "Запуск Kubernetes в tmux-сессии '$SESSION'..."
 
     tmux new-session \
         -d \
         -s "$SESSION" \
         -n "etcd" \
-        "cd '$LAB_DIR' && source '$VENV_DIR/bin/activate' && exec make etcd"
+        "cd '$LAB_DIR' && exec bash -lc 'make etcd 2>&1 | tee .state/k8s/etcd.log'"
+
+    wait_until "etcd" etcd_ready
 
     tmux_window "apiserver" "make apiserver"
+    wait_until "kube-apiserver" api_ready
 
-    log "Ожидание запуска API server..."
-    sleep 3
-
-    # manifest-bootstrap должен выполняться после запуска API server.
-    tmux_window "bootstrap" "bash -lc 'sleep 2; make manifest-bootstrap; exec bash'"
+    log "Применение bootstrap RBAC и токена kube-proxy..."
+    make -C "$LAB_DIR" manifest-bootstrap
 
     tmux_window "controller" "make controller-manager"
     tmux_window "netservice" "make netservice"
+    wait_until "сетевой сервис" test -S "$LAB_DIR/.state/k8s/run/net.unix"
+
     tmux_window "runtime" "make runtime"
+    wait_until "CRI pnfroot" runtime_ready
+
     tmux_window "kubelet" "make kubelet"
+    wait_until "нода node1 Ready" node_ready
+
     tmux_window "kube-proxy" "make kube-proxy"
 
-    log "Стенд запущен."
+    if [[ "$START_NGINX" == "1" ]]; then
+        log "Запуск проверочного nginx..."
+        kubectl_lab apply -f "$LAB_DIR/manifests/smoke/nginx-rootless.yaml"
+        kubectl_lab wait --for=condition=Ready pod/nginx-rootless \
+            --timeout="${START_TIMEOUT}s"
+    fi
+
+    log "Кластер запущен."
+    kubectl_lab get nodes,pods,svc -o wide
+    if [[ "$START_NGINX" == "1" ]]; then
+        log "nginx: http://$(hostname -I 2>/dev/null | awk '{print $1}'):30080/"
+    fi
     log "Подключиться: tmux attach -t $SESSION"
 }
 
@@ -218,6 +287,9 @@ status_lab() {
     if tmux has-session -t "$SESSION" 2>/dev/null; then
         log "Стенд запущен."
         tmux list-windows -t "$SESSION"
+        if [[ -x "$BIN_DIR/kubectl" && -f "$LAB_DIR/.state/k8s/etc/admin.kubeconfig" ]]; then
+            kubectl_lab get nodes,pods,svc -o wide || true
+        fi
     else
         log "Стенд остановлен."
         return 1
@@ -237,6 +309,8 @@ update_all() {
 usage() {
     cat <<EOF
 Использование:
+  $0            Запустить весь кластер и nginx одной командой
+  $0 up         То же, что start
   $0 init       Инициализировать submodule, venv, PKI и бинарники
   $0 start      Запустить стенд в tmux
   $0 stop       Остановить стенд
@@ -249,11 +323,11 @@ usage() {
 EOF
 }
 
-case "${1:-}" in
+case "${1:-start}" in
     init)
         init_all
         ;;
-    start)
+    start|up)
         start_lab
         ;;
     stop)
