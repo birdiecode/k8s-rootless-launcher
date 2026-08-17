@@ -176,7 +176,7 @@ tmux_window() {
     tmux new-window \
         -t "$SESSION" \
         -n "$name" \
-        "cd '$LAB_DIR' && exec bash -lc '$command 2>&1 | tee .state/k8s/$name.log'"
+        "cd '$LAB_DIR' && exec bash -lc 'set -o pipefail; $command 2>&1 | tee .state/k8s/$name.log'"
 }
 
 kubectl_lab() {
@@ -197,6 +197,40 @@ wait_until() {
     log "Готово: $description"
 }
 
+window_exists() {
+    local name="$1"
+    tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null |
+        grep -Fxq "$name"
+}
+
+wait_component() {
+    local description="$1"
+    local window="$2"
+    shift 2
+    local deadline=$((SECONDS + START_TIMEOUT))
+    local next_notice=$((SECONDS + 5))
+
+    while ! "$@" >/dev/null 2>&1; do
+        if ! window_exists "$window"; then
+            printf '\n' >&2
+            tail -n 80 "$LAB_DIR/.state/k8s/$window.log" >&2 || true
+            die "Компонент '$window' завершился при ожидании: $description"
+        fi
+        (( SECONDS < deadline )) || {
+            printf '\n' >&2
+            tail -n 80 "$LAB_DIR/.state/k8s/$window.log" >&2 || true
+            die "Истекло время ожидания: $description"
+        }
+        if (( SECONDS >= next_notice )); then
+            log "Ожидание: $description..."
+            next_notice=$((SECONDS + 5))
+        fi
+        sleep 1
+    done
+
+    log "Готово: $description"
+}
+
 etcd_ready() {
     curl -fsS --max-time 2 http://127.0.0.1:2379/health | grep -q '"health":"true"'
 }
@@ -206,7 +240,19 @@ api_ready() {
 }
 
 runtime_ready() {
-    [[ -S "$LAB_DIR/.state/k8s/run/pnfroot.sock" ]]
+    unix_socket_ready "$LAB_DIR/.state/k8s/run/pnfroot.sock"
+}
+
+netservice_ready() {
+    unix_socket_ready "$LAB_DIR/.state/k8s/run/net.unix"
+}
+
+unix_socket_ready() {
+    local socket_path="$1"
+    [[ -S "$socket_path" ]] || return 1
+    python3 -c \
+        'import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(sys.argv[1]); s.close()' \
+        "$socket_path"
 }
 
 node_ready() {
@@ -227,31 +273,36 @@ start_lab() {
     fi
 
     mkdir -p "$LAB_DIR/.state/k8s/run"
+    # Socket files survive an unclean Android/Termux shutdown. Their mere
+    # presence must not make a dead network or CRI service look ready.
+    rm -f \
+        "$LAB_DIR/.state/k8s/run/net.unix" \
+        "$LAB_DIR/.state/k8s/run/pnfroot.sock"
     log "Запуск Kubernetes в tmux-сессии '$SESSION'..."
 
     tmux new-session \
         -d \
         -s "$SESSION" \
         -n "etcd" \
-        "cd '$LAB_DIR' && exec bash -lc 'make etcd 2>&1 | tee .state/k8s/etcd.log'"
+        "cd '$LAB_DIR' && exec bash -lc 'set -o pipefail; make etcd 2>&1 | tee .state/k8s/etcd.log'"
 
-    wait_until "etcd" etcd_ready
+    wait_component "etcd" "etcd" etcd_ready
 
     tmux_window "apiserver" "make apiserver"
-    wait_until "kube-apiserver" api_ready
+    wait_component "kube-apiserver" "apiserver" api_ready
 
     log "Применение bootstrap RBAC и токена kube-proxy..."
     make -C "$LAB_DIR" manifest-bootstrap
 
     tmux_window "controller" "make controller-manager"
     tmux_window "netservice" "make netservice"
-    wait_until "сетевой сервис" test -S "$LAB_DIR/.state/k8s/run/net.unix"
+    wait_component "сетевой сервис" "netservice" netservice_ready
 
     tmux_window "runtime" "make runtime"
-    wait_until "CRI pnfroot" runtime_ready
+    wait_component "CRI pnfroot" "runtime" runtime_ready
 
     tmux_window "kubelet" "make kubelet"
-    wait_until "нода node1 Ready" node_ready
+    wait_component "нода node1 Ready" "kubelet" node_ready
 
     tmux_window "kube-proxy" "make kube-proxy"
 
@@ -265,7 +316,8 @@ start_lab() {
     log "Кластер запущен."
     kubectl_lab get nodes,pods,svc -o wide
     if [[ "$START_NGINX" == "1" ]]; then
-        log "nginx: http://$(hostname -I 2>/dev/null | awk '{print $1}'):30080/"
+        log "nginx локально: http://127.0.0.1:30080/"
+        log "nginx из сети: http://<IP-телефона>:30080/"
     fi
     log "Подключиться: tmux attach -t $SESSION"
 }
