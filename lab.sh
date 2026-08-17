@@ -176,7 +176,7 @@ tmux_window() {
     tmux new-window \
         -t "$SESSION" \
         -n "$name" \
-        "cd '$LAB_DIR' && exec bash -lc 'set -o pipefail; $command 2>&1 | tee .state/k8s/$name.log'"
+        "cd '$LAB_DIR' && exec $command >'.state/k8s/$name.log' 2>&1"
 }
 
 kubectl_lab() {
@@ -259,6 +259,10 @@ node_ready() {
     [[ "$(kubectl_lab get node node1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == "True" ]]
 }
 
+nodeport_ready() {
+    curl -fsS --max-time 2 http://127.0.0.1:30080/ >/dev/null
+}
+
 start_lab() {
     require_cmd tmux
     require_cmd curl
@@ -273,6 +277,9 @@ start_lab() {
     fi
 
     mkdir -p "$LAB_DIR/.state/k8s/run"
+    if command -v termux-wake-lock >/dev/null 2>&1; then
+        termux-wake-lock || true
+    fi
     # Socket files survive an unclean Android/Termux shutdown. Their mere
     # presence must not make a dead network or CRI service look ready.
     rm -f \
@@ -284,33 +291,37 @@ start_lab() {
         -d \
         -s "$SESSION" \
         -n "etcd" \
-        "cd '$LAB_DIR' && exec bash -lc 'set -o pipefail; make etcd 2>&1 | tee .state/k8s/etcd.log'"
+        "cd '$LAB_DIR' && exec scripts/start-etcd.sh >'.state/k8s/etcd.log' 2>&1"
 
     wait_component "etcd" "etcd" etcd_ready
 
-    tmux_window "apiserver" "make apiserver"
+    tmux_window "apiserver" "scripts/start-apiserver.sh"
     wait_component "kube-apiserver" "apiserver" api_ready
 
     log "Применение bootstrap RBAC и токена kube-proxy..."
     make -C "$LAB_DIR" manifest-bootstrap
 
-    tmux_window "controller" "make controller-manager"
-    tmux_window "netservice" "make netservice"
+    tmux_window "controller" "scripts/start-controller-manager.sh"
+    tmux_window "netservice" "scripts/start-netservice.sh"
     wait_component "сетевой сервис" "netservice" netservice_ready
 
-    tmux_window "runtime" "make runtime"
+    tmux_window "runtime" "scripts/start-runtime.sh"
     wait_component "CRI pnfroot" "runtime" runtime_ready
 
-    tmux_window "kubelet" "make kubelet"
+    tmux_window "kubelet" "scripts/start-kubelet.sh"
     wait_component "нода node1 Ready" "kubelet" node_ready
 
-    tmux_window "kube-proxy" "make kube-proxy"
+    tmux_window "kube-proxy" "scripts/start-kube-proxy.sh"
 
     if [[ "$START_NGINX" == "1" ]]; then
         log "Запуск проверочного nginx..."
+        # Recreate the standalone Pod so command/args changes from the tracked
+        # smoke manifest are applied (those Pod fields are immutable).
+        kubectl_lab delete pod nginx-rootless --ignore-not-found --wait=true
         kubectl_lab apply -f "$LAB_DIR/manifests/smoke/nginx-rootless.yaml"
         kubectl_lab wait --for=condition=Ready pod/nginx-rootless \
             --timeout="${START_TIMEOUT}s"
+        wait_component "nginx NodePort 30080" "kube-proxy" nodeport_ready
     fi
 
     log "Кластер запущен."
@@ -327,10 +338,19 @@ stop_lab() {
 
     if tmux has-session -t "$SESSION" 2>/dev/null; then
         tmux kill-session -t "$SESSION"
-        log "Стенд остановлен."
-    else
-        log "Сессия '$SESSION' не запущена."
     fi
+
+    # Android may kill tmux itself while leaving one or more children alive.
+    # Stop only processes whose command line points into this checkout.
+    pkill -TERM -f "$BIN_DIR/etcd" 2>/dev/null || true
+    pkill -TERM -f "$K8S_DIR/_output/bin/kube-apiserver" 2>/dev/null || true
+    pkill -TERM -f "$K8S_DIR/_output/bin/kube-controller-manager" 2>/dev/null || true
+    pkill -TERM -f "$K8S_DIR/_output/bin/kubelet" 2>/dev/null || true
+    pkill -TERM -f "$PNFROOT_DIR/pnfroot.py --socket-path $LAB_DIR/.state/k8s/run/pnfroot.sock" 2>/dev/null || true
+    pkill -TERM -f "netservice.server --socket $LAB_DIR/.state/k8s/run/net.unix" 2>/dev/null || true
+    pkill -TERM -f "$PROXY_DIR/main.py" 2>/dev/null || true
+    rm -f "$LAB_DIR/.state/k8s/run/net.unix" "$LAB_DIR/.state/k8s/run/pnfroot.sock"
+    log "Стенд остановлен."
 }
 
 status_lab() {
