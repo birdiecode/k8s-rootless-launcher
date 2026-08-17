@@ -12,7 +12,8 @@ BIN_DIR="$LAB_DIR/.local/bin"
 SESSION="rlk8s"
 ETCD_VERSION="${ETCD_VERSION:-3.7.1}"
 START_TIMEOUT="${START_TIMEOUT:-120}"
-START_NGINX="${START_NGINX:-1}"
+# The standalone smoke pod is opt-in; NodePort 30080 belongs to ingress-nginx.
+START_NGINX="${START_NGINX:-0}"
 
 log() {
     printf '\033[1;34m[rlk8s]\033[0m %s\n' "$*"
