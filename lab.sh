@@ -111,6 +111,9 @@ build_kubernetes() {
     mkdir -p "$BIN_DIR"
 
     log "Сборка kubectl, kubelet и kube-controller-manager..."
+    KUBE_GIT_VERSION="${KUBE_GIT_VERSION:-v1.36.0}" \
+    KUBE_GIT_COMMIT="${KUBE_GIT_COMMIT:-local}" \
+    KUBE_GIT_TREE_STATE="${KUBE_GIT_TREE_STATE:-clean}" \
     make -C "$K8S_DIR" \
         WHAT="cmd/kubectl cmd/kubelet cmd/kube-controller-manager cmd/kube-apiserver"
 
